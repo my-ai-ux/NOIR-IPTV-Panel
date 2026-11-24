@@ -1,42 +1,65 @@
-name: Build NOIR Panel IPA
+name: NOIR Panel iOS Build
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: macos-latest
+  build-ios:
+    runs-on: xcode-27
+
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Select Xcode 27.2
+        run: |
+          set -e
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcode-select -p
+          xcodebuild -version
+
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          brew install xcodegen
+          xcodegen --version
 
       - name: Generate Xcode Project
-        run: xcodegen generate
-
-      - name: Build Unsigned App
         run: |
-          xcodebuild -project NOIRPanel.xcodeproj \
+          set -e
+          xcodegen generate
+
+      - name: Build NOIRPanel
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project NOIRPanel.xcodeproj \
             -scheme NOIRPanel \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build \
+            -derivedDataPath build/noir \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_IDENTITY="" \
+            build
 
       - name: Package IPA
         run: |
-          mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/NOIRPanel.app Payload/
-          zip -r NOIRPanel.ipa Payload
+          set -e
+          mkdir -p artifacts/Payload
+          cp -R build/noir/Build/Products/Release-iphoneos/NOIRPanel.app artifacts/Payload/
+          cd artifacts
+          zip -qry "$GITHUB_WORKSPACE/NOIRPanel.ipa" Payload
 
-      - name: Upload IPA Artifact
+      - name: Upload NOIRPanel IPA
         uses: actions/upload-artifact@v4
         with:
           name: NOIRPanel-IPA
           path: NOIRPanel.ipa
+          if-no-files-found: error
