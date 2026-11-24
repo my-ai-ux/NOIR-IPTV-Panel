@@ -75,7 +75,7 @@ class PanelStore: ObservableObject {
 
     init() { load() }
 
-    // جميع الأقسام المتاحة (المحفوظة + الموجودة في القنوات)
+    // جميع الأقسام المتاحة
     var allAvailableGroups: [String] {
         let fromChannels = channels.map { $0.group }
         return Array(Set(savedCategories + fromChannels)).filter { !$0.isEmpty }.sorted()
@@ -86,6 +86,43 @@ class PanelStore: ObservableObject {
         if !clean.isEmpty && !savedCategories.contains(clean) {
             savedCategories.append(clean)
         }
+    }
+
+    // تغيير اسم القسم وتحديثه في جميع القنوات المرتبطة به
+    func renameCategory(oldName: String, newName: String) {
+        let cleanNew = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanNew.isEmpty, cleanNew != oldName else { return }
+
+        if let idx = savedCategories.firstIndex(of: oldName) {
+            savedCategories[idx] = cleanNew
+        } else if !savedCategories.contains(cleanNew) {
+            savedCategories.append(cleanNew)
+        }
+
+        for i in channels.indices {
+            if channels[i].group == oldName {
+                channels[i].group = cleanNew
+            }
+        }
+        syncToCloud()
+    }
+
+    // حذف القسم نهائياً بدون رجوع
+    func deleteCategory(_ categoryName: String, deleteChannelsInside: Bool) {
+        savedCategories.removeAll { $0 == categoryName }
+        if deleteChannelsInside {
+            channels.removeAll { $0.group == categoryName }
+        } else {
+            for i in channels.indices {
+                if channels[i].group == categoryName {
+                    channels[i].group = "عام"
+                }
+            }
+            if !channels.filter({ $0.group == "عام" }).isEmpty {
+                registerCategory("عام")
+            }
+        }
+        syncToCloud()
     }
 
     func addChannel(name: String, group: String, logo: String, url: String, type: MediaType) {
@@ -187,7 +224,7 @@ class PanelStore: ObservableObject {
         }.resume()
     }
 
-    // سحب اشتراك كامل عبر بيانات Xtream Codes (Host + User + Pass)
+    // سحب اشتراك كامل عبر بيانات Xtream Codes
     func importFromXtream(host: String, username: String, password: String, completion: @escaping (String) -> Void) {
         var cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanHost.hasSuffix("/") { cleanHost.removeLast() }
@@ -443,7 +480,6 @@ struct ContentManagerView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 10) {
-                // إحصائيات
                 HStack(spacing: 10) {
                     StatBox(title: "بث مباشر", value: "\(store.channels.filter { $0.type == .live }.count)", color: .purple)
                     StatBox(title: "أفلام", value: "\(store.channels.filter { $0.type == .vod }.count)", color: .orange)
@@ -452,7 +488,6 @@ struct ContentManagerView: View {
                 }
                 .padding(.horizontal)
 
-                // فلتر النوع (الكل / بث مباشر / أفلام / مسلسلات)
                 Picker("النوع", selection: $selectedTypeFilter) {
                     ForEach(typeFilters, id: \.self) { t in
                         Text(t).tag(t)
@@ -461,11 +496,10 @@ struct ContentManagerView: View {
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
 
-                // شريط الأقسام الأفقي + زر إضافة قسم
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button(action: { showCategorySheet = true }) {
-                            Label("قسم +", systemImage: "folder.badge.plus")
+                            Label("الأقسام", systemImage: "folder.badge.gearshape")
                                 .font(.caption.bold())
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
@@ -594,7 +628,7 @@ struct ContentManagerView: View {
                 AddEditChannelSheet(store: store, existingChannel: ch, initialGroup: ch.group)
             }
             .sheet(isPresented: $showCategorySheet) {
-                ManageCategoriesSheet(store: store)
+                ManageCategoriesSheet(store: store, selectedGroup: $selectedGroup)
             }
             .sheet(item: $playingURL) { url in
                 StreamPlayerView(url: url)
@@ -612,11 +646,15 @@ struct ContentManagerView: View {
     }
 }
 
-// نافذة إدارة الأقسام
+// MARK: - Manage Categories (Rename & Permanent Delete)
 struct ManageCategoriesSheet: View {
     @Environment(\.dismiss) var dismiss
     @ObservedObject var store: PanelStore
+    @Binding var selectedGroup: String
     @State private var newCatName = ""
+    @State private var categoryToRename: String?
+    @State private var renameText = ""
+    @State private var categoryToDelete: String?
 
     var body: some View {
         NavigationView {
@@ -632,21 +670,29 @@ struct ManageCategoriesSheet: View {
                     }
                 }
 
-                Section(header: Text("الأقسام المحفوظة")) {
+                Section(header: Text("الأقسام الحالية (اضغط لتغيير الاسم أو اسحب للحذف)")) {
                     ForEach(store.allAvailableGroups, id: \.self) { cat in
                         HStack {
                             Text(cat)
+                                .font(.body)
                             Spacer()
                             Text("\(store.channels.filter { $0.group == cat }.count) عنصر")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
+                            Image(systemName: "pencil")
+                                .font(.caption)
+                                .foregroundColor(.purple)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            categoryToRename = cat
+                            renameText = cat
                         }
                     }
                     .onDelete { idx in
                         let items = store.allAvailableGroups
-                        for i in idx {
-                            let target = items[i]
-                            store.savedCategories.removeAll { $0 == target }
+                        if let first = idx.first {
+                            categoryToDelete = items[first]
                         }
                     }
                 }
@@ -655,11 +701,52 @@ struct ManageCategoriesSheet: View {
             .toolbar {
                 Button("تم") { dismiss() }
             }
+            .alert("تغيير اسم القسم", isPresented: Binding(
+                get: { categoryToRename != nil },
+                set: { if !$0 { categoryToRename = nil } }
+            )) {
+                TextField("الاسم الجديد للقسم", text: $renameText)
+                Button("حفظ التعديل") {
+                    if let old = categoryToRename {
+                        let cleanNew = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        store.renameCategory(oldName: old, newName: cleanNew)
+                        if selectedGroup == old && !cleanNew.isEmpty {
+                            selectedGroup = cleanNew
+                        }
+                    }
+                    categoryToRename = nil
+                }
+                Button("إلغاء", role: .cancel) { categoryToRename = nil }
+            } message: {
+                Text("سيتم تحديث اسم القسم في جميع القنوات المرتبطة به وعلى السيرفر تلقائياً.")
+            }
+            .confirmationDialog("حذف القسم", isPresented: Binding(
+                get: { categoryToDelete != nil },
+                set: { if !$0 { categoryToDelete = nil } }
+            ), titleVisibility: .visible) {
+                Button("حذف القسم مع جميع القنوات بداخله", role: .destructive) {
+                    if let target = categoryToDelete {
+                        store.deleteCategory(target, deleteChannelsInside: true)
+                        if selectedGroup == target { selectedGroup = "الكل" }
+                    }
+                    categoryToDelete = nil
+                }
+                Button("حذف القسم فقط ونقل قنواته إلى (عام)") {
+                    if let target = categoryToDelete {
+                        store.deleteCategory(target, deleteChannelsInside: false)
+                        if selectedGroup == target { selectedGroup = "الكل" }
+                    }
+                    categoryToDelete = nil
+                }
+                Button("إلغاء", role: .cancel) { categoryToDelete = nil }
+            } message: {
+                Text("اختر طريقة حذف قسم \"\(categoryToDelete ?? "")\":")
+            }
         }
     }
 }
 
-// نافذة الإضافة والتعديل مع أزرار اختيار الأقسام الموجودة
+// MARK: - Add/Edit Channel Sheet
 struct AddEditChannelSheet: View {
     @Environment(\.dismiss) var dismiss
     @ObservedObject var store: PanelStore
@@ -906,7 +993,7 @@ struct SubscribersView: View {
 // MARK: - Tab 3: Subscription Cloner / Importer & Cloud
 struct ToolsView: View {
     @ObservedObject var store: PanelStore
-    @State private var importMode = 0 // 0 = Xtream, 1 = M3U URL, 2 = Raw Text
+    @State private var importMode = 0
     @State private var xtreamHost = ""
     @State private var xtreamUser = ""
     @State private var xtreamPass = ""
