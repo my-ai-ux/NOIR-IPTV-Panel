@@ -41,6 +41,14 @@ enum StreamHealth: String, Codable {
     case offline = "طافي"
 }
 
+struct SeriesEpisode: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var season: Int
+    var episode: Int
+    var title: String
+    var url: String
+}
+
 struct ChannelItem: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
@@ -50,6 +58,11 @@ struct ChannelItem: Identifiable, Codable, Equatable {
     var type: MediaType = .live
     var health: StreamHealth = .unknown
     var pingMs: Int? = nil
+    var plot: String = ""
+    var cast: String = ""
+    var rating: String = ""
+    var year: String = ""
+    var episodes: [SeriesEpisode] = []
 }
 
 struct SubUser: Identifiable, Codable, Equatable {
@@ -70,12 +83,11 @@ class PanelStore: ObservableObject {
     @Published var isSyncing = false
     @Published var syncStatus = "جاهز للمزامنة"
 
-    let serverURL = "https://noir-tv.mkdos101.workers.dev"
+    let serverURL = "https://noir-server.mkdos101.workers.dev"
     let adminKey = "noir2026"
 
     init() { load() }
 
-    // جميع الأقسام المتاحة
     var allAvailableGroups: [String] {
         let fromChannels = channels.map { $0.group }
         return Array(Set(savedCategories + fromChannels)).filter { !$0.isEmpty }.sorted()
@@ -88,7 +100,6 @@ class PanelStore: ObservableObject {
         }
     }
 
-    // تغيير اسم القسم وتحديثه في جميع القنوات المرتبطة به
     func renameCategory(oldName: String, newName: String) {
         let cleanNew = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanNew.isEmpty, cleanNew != oldName else { return }
@@ -107,7 +118,6 @@ class PanelStore: ObservableObject {
         syncToCloud()
     }
 
-    // حذف القسم نهائياً بدون رجوع
     func deleteCategory(_ categoryName: String, deleteChannelsInside: Bool) {
         savedCategories.removeAll { $0 == categoryName }
         if deleteChannelsInside {
@@ -125,18 +135,20 @@ class PanelStore: ObservableObject {
         syncToCloud()
     }
 
-    func addChannel(name: String, group: String, logo: String, url: String, type: MediaType) {
+    func addChannel(name: String, group: String, logo: String, url: String, type: MediaType, plot: String = "", cast: String = "") {
         let cleanURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanURL.isEmpty else { return }
         let finalGroup = group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "عام" : group.trimmingCharacters(in: .whitespacesAndNewlines)
         registerCategory(finalGroup)
 
         let item = ChannelItem(
-            name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "قناة جديدة" : name,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "عنصر جديد" : name,
             group: finalGroup,
             logo: logo.trimmingCharacters(in: .whitespacesAndNewlines),
             url: cleanURL,
-            type: type
+            type: type,
+            plot: plot,
+            cast: cast
         )
         channels.insert(item, at: 0)
         checkStreamHealth(id: item.id)
@@ -152,7 +164,152 @@ class PanelStore: ObservableObject {
         }
     }
 
-    // تحليل واستيراد نص M3U
+    // سحب الأفلام والمسلسلات من إضافة Stremio مع فاصل زمني آمن لحماية حساب TorBox / Debrid
+    func importFromStremioAddon(manifestURL: String, maxItemsPerCatalog: Int = 20, completion: @escaping (String) -> Void) {
+        var clean = manifestURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.hasPrefix("stremio://") {
+            clean = clean.replacingOccurrences(of: "stremio://", with: "https://")
+        }
+        guard let url = URL(string: clean), clean.hasSuffix("manifest.json") else {
+            completion("الرجاء لصق رابط إضافة ستريمو المنتهي بـ manifest.json")
+            return
+        }
+
+        let baseURL = clean.replacingOccurrences(of: "/manifest.json", with: "")
+        isSyncing = true
+
+        Task {
+            do {
+                let (manifestData, _) = try await URLSession.shared.data(from: url)
+                guard let manifestJson = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+                      let catalogs = manifestJson["catalogs"] as? [[String: Any]] else {
+                    self.isSyncing = false
+                    completion("تعذر قراءة ملف الإضافة (Manifest).")
+                    return
+                }
+
+                let addonName = manifestJson["name"] as? String ?? "Stremio"
+                var addedCount = 0
+
+                for cat in catalogs {
+                    guard let type = cat["type"] as? String,
+                          let catId = cat["id"] as? String,
+                          (type == "movie" || type == "series") else { continue }
+
+                    let catName = (cat["name"] as? String) ?? (type == "movie" ? "أفلام \(addonName)" : "مسلسلات \(addonName)")
+                    let catalogEndpoint = "\(baseURL)/catalog/\(type)/\(catId).json"
+                    guard let catURL = URL(string: catalogEndpoint),
+                          let (catData, _) = try? await URLSession.shared.data(from: catURL),
+                          let catJson = try? JSONSerialization.jsonObject(with: catData) as? [String: Any],
+                          let metas = catJson["metas"] as? [[String: Any]] else { continue }
+
+                    for meta in metas.prefix(maxItemsPerCatalog) {
+                        // فاصل زمني آمن (0.6 ثانية) لحماية TorBox من Rate Limit
+                        try? await Task.sleep(nanoseconds: 600_000_000)
+
+                        guard let itemId = meta["id"] as? String,
+                              let itemName = meta["name"] as? String else { continue }
+
+                        var poster = meta["poster"] as? String ?? ""
+                        var plot = meta["description"] as? String ?? ""
+                        var castList = (meta["cast"] as? [String])?.joined(separator: "، ") ?? ""
+                        var rating = meta["imdbRating"] as? String ?? ""
+                        var year = meta["releaseInfo"] as? String ?? ""
+
+                        var fetchedEpisodes: [SeriesEpisode] = []
+                        if let metaURL = URL(string: "\(baseURL)/meta/\(type)/\(itemId).json"),
+                           let (metaData, _) = try? await URLSession.shared.data(from: metaURL),
+                           let metaWrapper = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any],
+                           let fullMeta = metaWrapper["meta"] as? [String: Any] {
+
+                            if let p = fullMeta["poster"] as? String, !p.isEmpty { poster = p }
+                            if let d = fullMeta["description"] as? String, !d.isEmpty { plot = d }
+                            if let c = fullMeta["cast"] as? [String], !c.isEmpty { castList = c.joined(separator: "، ") }
+                            if let r = fullMeta["imdbRating"] as? String, !r.isEmpty { rating = r }
+                            if let y = fullMeta["releaseInfo"] as? String, !y.isEmpty { year = y }
+
+                            if type == "series", let videos = fullMeta["videos"] as? [[String: Any]] {
+                                for vid in videos.prefix(25) {
+                                    try? await Task.sleep(nanoseconds: 400_000_000)
+                                    guard let vidId = vid["id"] as? String else { continue }
+                                    let seasonNum = vid["season"] as? Int ?? 1
+                                    let epNum = vid["episode"] as? Int ?? 1
+                                    let epTitle = vid["title"] as? String ?? "الحلقة \(epNum)"
+
+                                    if let epStreamURL = URL(string: "\(baseURL)/stream/series/\(vidId).json"),
+                                       let (sData, _) = try? await URLSession.shared.data(from: epStreamURL),
+                                       let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any],
+                                       let streams = sJson["streams"] as? [[String: Any]],
+                                       let direct = streams.first(where: {
+                                           ($0["infoHash"] == nil) && (($0["url"] as? String)?.hasPrefix("http") == true)
+                                       })?["url"] as? String {
+                                        fetchedEpisodes.append(SeriesEpisode(season: seasonNum, episode: epNum, title: epTitle, url: direct))
+                                    }
+                                }
+                            }
+                        }
+
+                        if type == "movie" {
+                            if let streamURL = URL(string: "\(baseURL)/stream/movie/\(itemId).json"),
+                               let (streamData, _) = try? await URLSession.shared.data(from: streamURL),
+                               let streamJson = try? JSONSerialization.jsonObject(with: streamData) as? [String: Any],
+                               let streams = streamJson["streams"] as? [[String: Any]],
+                               let directLink = streams.first(where: {
+                                   ($0["infoHash"] == nil) && (($0["url"] as? String)?.hasPrefix("http") == true)
+                               })?["url"] as? String {
+
+                                let groupTitle = "\(addonName) - \(catName)"
+                                self.registerCategory(groupTitle)
+                                let newMovie = ChannelItem(
+                                    name: itemName,
+                                    group: groupTitle,
+                                    logo: poster,
+                                    url: directLink,
+                                    type: .vod,
+                                    plot: plot,
+                                    cast: castList,
+                                    rating: rating,
+                                    year: year
+                                )
+                                self.channels.insert(newMovie, at: 0)
+                                addedCount += 1
+                            }
+                        } else if type == "series" && !fetchedEpisodes.isEmpty {
+                            let groupTitle = "\(addonName) - \(catName)"
+                            self.registerCategory(groupTitle)
+                            let newSeries = ChannelItem(
+                                name: itemName,
+                                group: groupTitle,
+                                logo: poster,
+                                url: fetchedEpisodes.first?.url ?? "",
+                                type: .series,
+                                plot: plot,
+                                cast: castList,
+                                rating: rating,
+                                year: year,
+                                episodes: fetchedEpisodes
+                            )
+                            self.channels.insert(newSeries, at: 0)
+                            addedCount += 1
+                        }
+                    }
+                }
+
+                self.isSyncing = false
+                if addedCount > 0 {
+                    self.syncToCloud()
+                    completion("تم سحب \(addedCount) فيلم/مسلسل بأمان تام ورفعها للسيرفر!")
+                } else {
+                    completion("لم يتم العثور على روابط مباشرة (تأكد من تفعيل خيار منع التورنت / Debrid في إعدادات الإضافة).")
+                }
+            } catch {
+                self.isSyncing = false
+                completion("حدث خطأ أثناء الاتصال بالإضافة.")
+            }
+        }
+    }
+
+    // تحليل M3U
     func importM3U(rawText: String, defaultType: MediaType = .live) -> Int {
         let lines = rawText.components(separatedBy: .newlines)
         var currentName = ""
@@ -200,7 +357,6 @@ class PanelStore: ObservableObject {
         return importedCount
     }
 
-    // سحب اشتراك كامل عبر رابط M3U URL
     func importFromM3UURL(_ urlString: String, completion: @escaping (String) -> Void) {
         let clean = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: clean) else {
@@ -219,12 +375,11 @@ class PanelStore: ObservableObject {
                     return
                 }
                 let count = self.importM3U(rawText: content, defaultType: .live)
-                completion(count > 0 ? "تم نسخ واستيراد \(count) قناة/محتوى بنجاح!" : "الملف فارغ أو لا يحتوي روابط صالحة")
+                completion(count > 0 ? "تم نسخ واستيراد \(count) عنصر بنجاح!" : "الملف فارغ أو لا يحتوي روابط صالحة")
             }
         }.resume()
     }
 
-    // سحب اشتراك كامل عبر بيانات Xtream Codes
     func importFromXtream(host: String, username: String, password: String, completion: @escaping (String) -> Void) {
         var cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanHost.hasSuffix("/") { cleanHost.removeLast() }
@@ -247,7 +402,6 @@ class PanelStore: ObservableObject {
         return nil
     }
 
-    // فحص البث
     func checkStreamHealth(id: UUID) {
         guard let index = channels.firstIndex(where: { $0.id == id }),
               let url = URL(string: channels[index].url) else { return }
@@ -256,7 +410,7 @@ class PanelStore: ObservableObject {
         let startTime = Date()
 
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = "HEAD"
         request.timeoutInterval = 8
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
 
@@ -276,12 +430,18 @@ class PanelStore: ObservableObject {
     }
 
     func checkAllStreams() {
-        for ch in channels {
-            checkStreamHealth(id: ch.id)
+        Task {
+            for ch in channels {
+                let lower = ch.url.lowercased()
+                if lower.contains("torbox") || lower.contains("real-debrid") || lower.contains("debrid") {
+                    continue
+                }
+                checkStreamHealth(id: ch.id)
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
         }
     }
 
-    // المشتركين
     func addUser(username: String, password: String, days: Int) {
         let u = username.trimmingCharacters(in: .whitespacesAndNewlines)
         let p = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -297,7 +457,6 @@ class PanelStore: ObservableObject {
         }
     }
 
-    // المزامنة مع السيرفر
     func syncToCloud() {
         guard let url = URL(string: "\(serverURL)/api/sync") else { return }
         isSyncing = true
@@ -310,13 +469,25 @@ class PanelStore: ObservableObject {
 
         let activeUsers = users.filter { $0.isActive }
         let payload: [String: Any] = [
-            "channels": channels.map { [
-                "name": $0.name,
-                "group": $0.group,
-                "logo": $0.logo,
-                "url": $0.url,
-                "type": $0.type.serverCode
-            ] },
+            "channels": channels.map { ch in
+                [
+                    "name": ch.name,
+                    "group": ch.group,
+                    "logo": ch.logo,
+                    "url": ch.url,
+                    "type": ch.type.serverCode,
+                    "plot": ch.plot,
+                    "cast": ch.cast,
+                    "rating": ch.rating,
+                    "year": ch.year,
+                    "episodes": ch.episodes.map { [
+                        "season": $0.season,
+                        "episode": $0.episode,
+                        "title": $0.title,
+                        "url": $0.url
+                    ] }
+                ] as [String: Any]
+            },
             "users": activeUsers.map { [
                 "username": $0.username,
                 "password": $0.password,
@@ -366,13 +537,34 @@ class PanelStore: ObservableObject {
                         let group = dict["group"] as? String ?? "عام"
                         let logo = dict["logo"] as? String ?? ""
                         let typeStr = dict["type"] as? String ?? "live"
+                        let plot = dict["plot"] as? String ?? ""
+                        let cast = dict["cast"] as? String ?? ""
+                        let rating = dict["rating"] as? String ?? ""
+                        let year = dict["year"] as? String ?? ""
+                        var eps: [SeriesEpisode] = []
+                        if let rawEps = dict["episodes"] as? [[String: Any]] {
+                            eps = rawEps.compactMap { e in
+                                guard let u = e["url"] as? String else { return nil }
+                                return SeriesEpisode(
+                                    season: e["season"] as? Int ?? 1,
+                                    episode: e["episode"] as? Int ?? 1,
+                                    title: e["title"] as? String ?? "حلقة",
+                                    url: u
+                                )
+                            }
+                        }
                         self.registerCategory(group)
                         return ChannelItem(
                             name: name,
                             group: group,
                             logo: logo,
                             url: streamUrl,
-                            type: MediaType.fromServer(typeStr)
+                            type: MediaType.fromServer(typeStr),
+                            plot: plot,
+                            cast: cast,
+                            rating: rating,
+                            year: year,
+                            episodes: eps
                         )
                     }
                 }
@@ -401,24 +593,24 @@ class PanelStore: ObservableObject {
 
     private func save() {
         if let chData = try? JSONEncoder().encode(channels) {
-            UserDefaults.standard.set(chData, forKey: "noir_v3_channels")
+            UserDefaults.standard.set(chData, forKey: "noir_v4_channels")
         }
         if let uData = try? JSONEncoder().encode(users) {
-            UserDefaults.standard.set(uData, forKey: "noir_v3_users")
+            UserDefaults.standard.set(uData, forKey: "noir_v4_users")
         }
-        UserDefaults.standard.set(savedCategories, forKey: "noir_v3_cats")
+        UserDefaults.standard.set(savedCategories, forKey: "noir_v4_cats")
     }
 
     private func load() {
-        if let chData = UserDefaults.standard.data(forKey: "noir_v3_channels"),
+        if let chData = UserDefaults.standard.data(forKey: "noir_v4_channels"),
            let decoded = try? JSONDecoder().decode([ChannelItem].self, from: chData) {
             channels = decoded
         }
-        if let uData = UserDefaults.standard.data(forKey: "noir_v3_users"),
+        if let uData = UserDefaults.standard.data(forKey: "noir_v4_users"),
            let decoded = try? JSONDecoder().decode([SubUser].self, from: uData) {
             users = decoded
         }
-        if let cats = UserDefaults.standard.stringArray(forKey: "noir_v3_cats") {
+        if let cats = UserDefaults.standard.stringArray(forKey: "noir_v4_cats") {
             savedCategories = cats
         }
     }
@@ -442,14 +634,14 @@ struct ContentView: View {
 
             ToolsView(store: store)
                 .tabItem {
-                    Label("سحب اشتراك والسيرفر", systemImage: "arrow.down.doc.fill")
+                    Label("سحب اشتراك وستريمو", systemImage: "sparkles.tv.fill")
                 }
         }
         .accentColor(Color(red: 0.65, green: 0.35, blue: 0.98))
     }
 }
 
-// MARK: - Tab 1: Content, Categories & Stream Checker
+// MARK: - Tab 1: Content & Stream Checker
 struct ContentManagerView: View {
     @ObservedObject var store: PanelStore
     @State private var searchText = ""
@@ -531,7 +723,7 @@ struct ContentManagerView: View {
                             .foregroundColor(.gray)
                         Text("لا يوجد محتوى في هذا القسم")
                             .font(.headline)
-                        Text("اضغط + لإضافة رابط جديد أو اسحب اشتراك جاهز من تبويب (سحب اشتراك).")
+                        Text("اضغط + لإضافة رابط أو اسحب مكتبة أفلام ومسلسلات من تبويب (سحب اشتراك وستريمو).")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -559,6 +751,12 @@ struct ContentManagerView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(ch.name)
                                         .font(.headline)
+                                    if !ch.plot.isEmpty {
+                                        Text(ch.plot)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                    }
                                     HStack(spacing: 6) {
                                         Text(ch.group)
                                             .font(.caption2)
@@ -569,6 +767,11 @@ struct ContentManagerView: View {
                                         Text(ch.type.rawValue)
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
+                                        if !ch.episodes.isEmpty {
+                                            Text("(\(ch.episodes.count) حلقة)")
+                                                .font(.caption2)
+                                                .foregroundColor(.pink)
+                                        }
                                     }
                                 }
 
@@ -646,7 +849,7 @@ struct ContentManagerView: View {
     }
 }
 
-// MARK: - Manage Categories (Rename & Permanent Delete)
+// MARK: - Manage Categories
 struct ManageCategoriesSheet: View {
     @Environment(\.dismiss) var dismiss
     @ObservedObject var store: PanelStore
@@ -674,7 +877,6 @@ struct ManageCategoriesSheet: View {
                     ForEach(store.allAvailableGroups, id: \.self) { cat in
                         HStack {
                             Text(cat)
-                                .font(.body)
                             Spacer()
                             Text("\(store.channels.filter { $0.group == cat }.count) عنصر")
                                 .font(.caption)
@@ -718,20 +920,20 @@ struct ManageCategoriesSheet: View {
                 }
                 Button("إلغاء", role: .cancel) { categoryToRename = nil }
             } message: {
-                Text("سيتم تحديث اسم القسم في جميع القنوات المرتبطة به وعلى السيرفر تلقائياً.")
+                Text("سيتم تحديث اسم القسم في جميع العناصر المرتبطة به وعلى السيرفر تلقائياً.")
             }
             .confirmationDialog("حذف القسم", isPresented: Binding(
                 get: { categoryToDelete != nil },
                 set: { if !$0 { categoryToDelete = nil } }
             ), titleVisibility: .visible) {
-                Button("حذف القسم مع جميع القنوات بداخله", role: .destructive) {
+                Button("حذف القسم مع جميع المحتوى بداخله", role: .destructive) {
                     if let target = categoryToDelete {
                         store.deleteCategory(target, deleteChannelsInside: true)
                         if selectedGroup == target { selectedGroup = "الكل" }
                     }
                     categoryToDelete = nil
                 }
-                Button("حذف القسم فقط ونقل قنواته إلى (عام)") {
+                Button("حذف القسم فقط ونقل المحتوى إلى (عام)") {
                     if let target = categoryToDelete {
                         store.deleteCategory(target, deleteChannelsInside: false)
                         if selectedGroup == target { selectedGroup = "الكل" }
@@ -757,6 +959,8 @@ struct AddEditChannelSheet: View {
     @State private var group = ""
     @State private var logo = ""
     @State private var url = ""
+    @State private var plot = ""
+    @State private var cast = ""
     @State private var type: MediaType = .live
     @State private var previewURL: URL?
 
@@ -772,7 +976,7 @@ struct AddEditChannelSheet: View {
                     .pickerStyle(.segmented)
                 }
 
-                Section(header: Text("2. القسم (اختر من الموجود أو اكتب قسماً جديداً)")) {
+                Section(header: Text("2. القسم")) {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
                             ForEach(store.allAvailableGroups, id: \.self) { existingGrp in
@@ -794,13 +998,20 @@ struct AddEditChannelSheet: View {
                     TextField("اسم القسم (مثال: الرياضية)", text: $group)
                 }
 
-                Section(header: Text("3. بيانات البث")) {
-                    TextField("الاسم (مثال: الرياضية 1، مسلسل...)", text: $name)
+                Section(header: Text("3. البيانات الأساسية")) {
+                    TextField("الاسم", text: $name)
                     TextField("رابط البث (.m3u8 أو .mp4)", text: $url)
                         .textInputAutocapitalization(.never)
                         .disableAutocorrection(true)
-                    TextField("رابط الشعار Logo (اختياري)", text: $logo)
+                    TextField("رابط البوستر / الشعار (اختياري)", text: $logo)
                         .textInputAutocapitalization(.never)
+                }
+
+                if type != .live {
+                    Section(header: Text("4. تفاصيل الفيلم أو المسلسل (تظهر في المشغل)")) {
+                        TextField("الممثلين (مثال: Tom Cruise, ...)", text: $cast)
+                        TextField("قصة الفيلم / الوصف", text: $plot)
+                    }
                 }
 
                 if let validURL = URL(string: url.trimmingCharacters(in: .whitespacesAndNewlines)), !url.isEmpty {
@@ -812,7 +1023,7 @@ struct AddEditChannelSheet: View {
                     }
                 }
             }
-            .navigationTitle(existingChannel == nil ? "إضافة رابط جديد" : "تعديل الرابط")
+            .navigationTitle(existingChannel == nil ? "إضافة رابط جديد" : "تعديل البيانات")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("إلغاء") { dismiss() }
@@ -825,9 +1036,11 @@ struct AddEditChannelSheet: View {
                             edited.logo = logo
                             edited.url = url.trimmingCharacters(in: .whitespacesAndNewlines)
                             edited.type = type
+                            edited.plot = plot
+                            edited.cast = cast
                             store.updateChannel(edited)
                         } else {
-                            store.addChannel(name: name, group: group, logo: logo, url: url, type: type)
+                            store.addChannel(name: name, group: group, logo: logo, url: url, type: type, plot: plot, cast: cast)
                         }
                         dismiss()
                     }
@@ -841,6 +1054,8 @@ struct AddEditChannelSheet: View {
                     logo = ch.logo
                     url = ch.url
                     type = ch.type
+                    plot = ch.plot
+                    cast = ch.cast
                 } else if !initialGroup.isEmpty {
                     group = initialGroup
                 }
@@ -852,7 +1067,7 @@ struct AddEditChannelSheet: View {
     }
 }
 
-// MARK: - Tab 2: Subscriptions Generator
+// MARK: - Tab 2: Subscriptions
 struct SubscribersView: View {
     @ObservedObject var store: PanelStore
     @State private var username = ""
@@ -990,36 +1205,61 @@ struct SubscribersView: View {
     }
 }
 
-// MARK: - Tab 3: Subscription Cloner / Importer & Cloud
+// MARK: - Tab 3: Stremio Addon Importer & IPTV Cloner
 struct ToolsView: View {
     @ObservedObject var store: PanelStore
     @State private var importMode = 0
+    @State private var stremioManifest = ""
+    @State private var stremioLimit = 15
     @State private var xtreamHost = ""
     @State private var xtreamUser = ""
     @State private var xtreamPass = ""
     @State private var m3uLink = ""
-    @State private var m3uRawText = ""
     @State private var statusAlert = ""
     @State private var showAlert = false
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("نسخ محتوى اشتراك IPTV جاهز وإضافته")) {
-                    Picker("طريقة السحب", selection: $importMode) {
-                        Text("بيانات Xtream").tag(0)
-                        Text("رابط M3U").tag(1)
-                        Text("نص M3U").tag(2)
+                Section(header: Text("سحب الأفلام والمسلسلات أو الاشتراكات")) {
+                    Picker("المصدر", selection: $importMode) {
+                        Text("إضافة Stremio").tag(0)
+                        Text("Xtream").tag(1)
+                        Text("رابط M3U").tag(2)
                     }
                     .pickerStyle(.segmented)
 
                     if importMode == 0 {
+                        TextField("رابط الإضافة (https://.../manifest.json)", text: $stremioManifest)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+
+                        Stepper("عدد العناصر لكل قسم: \(stremioLimit)", value: $stremioLimit, in: 5...50, step: 5)
+
+                        Text("يجلب الأفلام والمسلسلات فقط مع البوستر، الوصف، الممثلين، والحلقات بفاصل زمني آمن لحماية حساب TorBox.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+
+                        Button(action: {
+                            store.importFromStremioAddon(manifestURL: stremioManifest, maxItemsPerCatalog: stremioLimit) { msg in
+                                statusAlert = msg
+                                showAlert = true
+                            }
+                        }) {
+                            HStack {
+                                Label("سحب الأفلام والمسلسلات الآن", systemImage: "sparkles.tv.fill")
+                                if store.isSyncing { Spacer(); ProgressView() }
+                            }
+                        }
+                        .disabled(stremioManifest.isEmpty || store.isSyncing)
+
+                    } else if importMode == 1 {
                         TextField("الهوست (مثال: http://line.tv:8080)", text: $xtreamHost)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
-                        TextField("اسم المستخدم (Username)", text: $xtreamUser)
+                        TextField("اسم المستخدم", text: $xtreamUser)
                             .textInputAutocapitalization(.never)
-                        TextField("كلمة المرور (Password)", text: $xtreamPass)
+                        TextField("كلمة المرور", text: $xtreamPass)
                             .textInputAutocapitalization(.never)
 
                         Button(action: {
@@ -1029,13 +1269,13 @@ struct ToolsView: View {
                             }
                         }) {
                             HStack {
-                                Label("سحب كل قنوات وأقسام الاشتراك", systemImage: "arrow.down.circle.fill")
+                                Label("سحب اشتراك Xtream كامل", systemImage: "arrow.down.circle.fill")
                                 if store.isSyncing { Spacer(); ProgressView() }
                             }
                         }
                         .disabled(xtreamHost.isEmpty || xtreamUser.isEmpty || xtreamPass.isEmpty || store.isSyncing)
 
-                    } else if importMode == 1 {
+                    } else {
                         TextField("رابط اشتراك M3U المباشر (http://...)", text: $m3uLink)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
@@ -1047,34 +1287,11 @@ struct ToolsView: View {
                             }
                         }) {
                             HStack {
-                                Label("تحميل ونسخ القائمة من الرابط", systemImage: "link.badge.plus")
+                                Label("تحميل القائمة من الرابط", systemImage: "link.badge.plus")
                                 if store.isSyncing { Spacer(); ProgressView() }
                             }
                         }
                         .disabled(m3uLink.isEmpty || store.isSyncing)
-
-                    } else {
-                        TextEditor(text: $m3uRawText)
-                            .frame(height: 110)
-                            .overlay(
-                                Group {
-                                    if m3uRawText.isEmpty {
-                                        Text("الصق محتوى #EXTM3U هنا...")
-                                            .foregroundColor(.gray)
-                                            .padding(8)
-                                    }
-                                }, alignment: .topLeading
-                            )
-
-                        Button(action: {
-                            let count = store.importM3U(rawText: m3uRawText)
-                            m3uRawText = ""
-                            statusAlert = count > 0 ? "تم استيراد \(count) رابط بنجاح!" : "لم يتم العثور على روابط."
-                            showAlert = true
-                        }) {
-                            Label("تحليل وإضافة النص", systemImage: "doc.text.fill")
-                        }
-                        .disabled(m3uRawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
 
@@ -1105,7 +1322,7 @@ struct ToolsView: View {
                     }
                 }
             }
-            .navigationTitle("سحب اشتراك والسيرفر")
+            .navigationTitle("سحب اشتراك وستريمو")
             .alert("النتيجة", isPresented: $showAlert) {
                 Button("حسناً", role: .cancel) {}
             } message: {
